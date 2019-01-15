@@ -20,6 +20,7 @@ setup_kissbash() {
 }
 
 drproper() {
+    cd
     for d in $dev1 $dev2; do
         color ylw "checking $d"
         if grep $d <(explicitly mount | grep ^/dev | tee_serr_with_color YLW); then
@@ -70,8 +71,9 @@ stage4() {
 
     mkdir -p $downloads
     cd $downloads
-    if [ ! -f $tarball ]; then
+    if [ -f $folder/$tarball ]; then
         color ylw "$tarball exists"
+    else
         explicitly wget --recursive --no-parent http://$folder
     fi
 
@@ -90,8 +92,9 @@ let_there_be_portage() {
 
     mkdir -p $downloads
     cd $downloads
-    if [ ! -f $tarball ]; then
+    if [ -f $tarball ]; then
         color ylw "$tarball exists"
+    else
         explicitly wget $url
     fi
     sudo cp -v $tarball $rootfs
@@ -101,17 +104,19 @@ let_there_be_portage() {
 }
 
 adjust_bootfs() {
-    sudo mv -v * "$rootfs"/boot/* "$bootfs"/
+    sudo mv -v "$rootfs"/boot/* "$bootfs"/
     sudo umount "$bootfs"
     sudo mount $dev1 "$rootfs"/boot
     bootfs="$rootfs"/boot
 }
 
 sofarsogood() {
+    drproper
     let_there_be_disk
     mount_disk
     stage4
     let_there_be_portage
+    adjust_bootfs
 }
 
 
