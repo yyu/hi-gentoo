@@ -182,6 +182,7 @@ sudo_append() {
     serr_with_color GRY 'sudo_append--------------------------------------------------------------------------------'
 
     local dest=$1
+    shift
     local tmpf=`make_tmpf_from $dest`
     echo "$*" >> $tmpf
     sudo cp -vf $tmpf $dest
@@ -219,19 +220,97 @@ setup_fstab() {
     cat $rootfs/etc/fstab | serr_with_color ylw
 }
 
-setup_resolv_conf() {
-    serr_with_color GRY 'setup_resolv_conf--------------------------------------------------------------------------------'
+setup_net() {
+    serr_with_color GRY 'setup_net--------------------------------------------------------------------------------'
 
     sudo_comment_all $rootfs/etc/resolv.conf
     sudo_append_file $rootfs/etc/resolv.conf /etc/resolv.conf
 
     cat $rootfs/etc/resolv.conf | serr_with_color ylw
+
+    cat > /tmp/50-dhcp.network << "END"
+[Match]
+Name=*
+
+[Network]
+DHCP=yes
+END
+
+    explicitly sudo cp -v /tmp/50-dhcp.network $rootfs/etc/systemd/network/50-dhcp.network
+}
+
+setup_ec2_init() {
+    cat > $rootfs/tmp/ec2init << "EOF"
+#!/bin/sh
+
+provision_instance() {
+    lock="/var/lib/amazon-ec2-init.lock"
+    instance_id="$(curl -s http://169.254.169.254/latest/meta-data/instance-id)"
+
+    [ -f "$lock" ] && [ "$(cat "$lock")" = "$instance_id" ] && exit 0
+
+    echo "Provisioning instance..."
+
+    provision_hostname
+    provision_ssh_authorized_keys
+    provision_systemd_machine_id
+
+    echo "$instance_id" > "$lock"
+}
+
+provision_hostname() {
+    echo "Setting hostname..."
+
+    hostnamectl set-hostname \
+        "$(curl -s http://169.254.169.254/latest/meta-data/local-hostname)"
+}
+
+provision_ssh_authorized_keys() {
+    echo "Importing SSH authorized keys..."
+
+    [ -e /root/.ssh ] && rm -rf /root/.ssh
+    mkdir -p /root/.ssh
+    chown root:root /root/.ssh
+    chmod 750 /root/.ssh
+
+    keys="$(curl -s http://169.254.169.254/latest/meta-data/public-keys/ \
+        | cut -d = -f 1 \
+        | xargs printf "http://169.254.169.254/latest/meta-data/public-keys/%s/openssh-key\n")"
+
+    if [ -n "$keys" ]; then
+        curl -s $keys > /root/.ssh/authorized_keys
+        chown root:root /root/.ssh/authorized_keys
+        chmod 640 /root/.ssh/authorized_keys
+    fi
+}
+
+provision_systemd_machine_id() {
+    echo "Regenerating systemd machine ID..."
+
+    systemd-machine-id-setup
+}
+
+provision_instance
+EOF
+
+    cat > $rootfs/tmp/ec2init.service << "EOF"
+[Unit]
+Description=Amazon EC2 Init
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/amazon-ec2-init
+
+[Install]
+WantedBy=multi-user.target
+EOF
 }
 
 configure_portage() {
     serr_with_color GRY 'configure_portage--------------------------------------------------------------------------------'
 
-    explicitly sed -E '/COMMON_FLAGS=/s/="/="-march=native /g' -i $rootfs/etc/portage/make.conf
+    explicitly sudo sed -E '/COMMON_FLAGS=/s/="/="-march=native /g' -i $rootfs/etc/portage/make.conf
     sudo_append $rootfs/etc/portage/make.conf 'MAKEOPTS="-j'`nproc`'"'
 
     sudo mkdir --parents $rootfs/etc/portage/repos.conf
@@ -251,16 +330,60 @@ do_chroot() {
 
     #explicitly cp -vf $SELF $rootfs$downloads
 
-    cat > $rootfs/tmp/after_chroot << "EOF"
+    cat > $rootfs/tmp/after_chroot << EOF
 . /etc/profile
-export PS1="(chroot) ${PS1}"
+export PS1="(chroot) \${PS1}"
 alias lh='ls -lh --color'
 x() {
     umount /boot
     exit
 }
+
+setup_grub() {
+    sed -E '/GRUB_CMDLINE_LINUX=/s|"$| init=/lib/systemd/systemd"|g' -i /etc/default/grub
+    grub-install $dev
+    grub-mkconfig -o /boot/grub/grub.cfg
+}
+
+setup_systemd() {
+    systemd-machine-id-setup
+
+    systemctl enable systemd-networkd.service
+
+    ln -snf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+    systemctl enable systemd-resolved.service
+    systemctl enable sshd.service
+}
+
+setup_ec2init() {
+    cp -vf /tmp/ec2init /usr/local/bin/amazon-ec2-init
+    chmod +x /usr/local/bin/amazon-ec2-init
+    cp -vf /tmp/ec2init.service /etc/systemd/system/amazon-ec2-init.service
+    systemctl enable amazon-ec2-init.service
+}
+
+echo 'now do:
+setup_grub
+setup_systemd
+setup_ec2init
+'
 EOF
     #echo ". $downloads/$naked_self" >> $rootfs/tmp/after_chroot
+
+    cat > $rootfs/root/setup.sh << "EOF"
+setup_essentials() {
+    eselect profile list
+    echo -n "which profile? "
+    read profile_num
+    eselect profile set $profilenum
+    emerge -DUnv @world
+    emerge -DUnv vim
+    emerge -DUnv dev-vcs/git
+    emerge -DUnv tmux
+    emerge -DUnv vim
+    python3 "$(curl -fsSL https://git.io/v7LAT)"
+}
+EOF
 
     explicitly sudo mount --types proc   /proc $rootfs/proc
     explicitly sudo mount --rbind        /sys  $rootfs/sys
@@ -272,6 +395,7 @@ EOF
 }
 
 prepare_and_chroot() {
+    echo '
     if ! explicitly echo; then
         setup_kissbash
     fi
@@ -282,9 +406,11 @@ prepare_and_chroot() {
     let_there_be_portage
     adjust_bootfs
     setup_fstab
-    setup_resolv_conf
+    setup_net
     configure_portage
+    setup_ec2_init
     do_chroot
+    '
 }
 
 
